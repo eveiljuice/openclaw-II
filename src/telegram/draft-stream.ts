@@ -114,7 +114,15 @@ export function createTelegramDraftStream(params: {
       if (nativeStreaming) {
         // Use Bot API 9.5 sendMessageDraft for smooth streaming without flicker.
         // No message_id tracking needed — draft slot is identified by draftId.
-        await params.api.sendMessageDraft(chatId, draftId, renderedText, threadParams);
+        await params.api.sendMessageDraft({
+          chat_id: chatId,
+          draft_id: draftId,
+          text: renderedText,
+          ...(threadParams?.message_thread_id != null && {
+            message_thread_id: threadParams.message_thread_id,
+          }),
+          ...(renderedParseMode && { parse_mode: renderedParseMode }),
+        });
         return true;
       }
       if (typeof streamMessageId === "number") {
