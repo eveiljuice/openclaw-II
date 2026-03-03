@@ -63,7 +63,7 @@ export function createTelegramDraftStream(params: {
       ? { ...threadParams, reply_to_message_id: params.replyToMessageId }
       : threadParams;
 
-  const nativeStreaming = params.nativeStreaming === true;
+  let nativeStreaming = params.nativeStreaming === true;
   const draftId = params.draftId ?? 1;
 
   const streamState = { stopped: false, final: false };
@@ -114,18 +114,28 @@ export function createTelegramDraftStream(params: {
       if (nativeStreaming) {
         // Use Bot API 9.5 sendMessageDraft for smooth streaming without flicker.
         // No message_id tracking needed — draft slot is identified by draftId.
-        // Cast to any: grammy typings may lag behind Bot API 9.5.
+        // Runtime check: grammy v1.41.0 may not have sendMessageDraft yet.
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        await (params.api as any).sendMessageDraft({
-          chat_id: chatId,
-          draft_id: draftId,
-          text: renderedText,
-          ...(threadParams?.message_thread_id != null && {
-            message_thread_id: threadParams.message_thread_id,
-          }),
-          ...(renderedParseMode && { parse_mode: renderedParseMode }),
-        });
-        return true;
+        const api = params.api as any;
+        if (typeof api.sendMessageDraft !== "function") {
+          // Fallback: disable native streaming and proceed with editMessageText.
+          params.warn?.(
+            "sendMessageDraft not available in current grammy version, falling back to editMessageText",
+          );
+          nativeStreaming = false;
+          // Fall through to the standard send/edit path below.
+        } else {
+          await api.sendMessageDraft({
+            chat_id: chatId,
+            draft_id: draftId,
+            text: renderedText,
+            ...(threadParams?.message_thread_id != null && {
+              message_thread_id: threadParams.message_thread_id,
+            }),
+            ...(renderedParseMode && { parse_mode: renderedParseMode }),
+          });
+          return true;
+        }
       }
       if (typeof streamMessageId === "number") {
         if (renderedParseMode) {

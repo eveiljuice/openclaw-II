@@ -191,6 +191,9 @@ export const dispatchTelegramMessage = async ({
   const mediaLocalRoots = getAgentScopedMediaLocalRoots(cfg, route.agentId);
   const archivedAnswerPreviews: ArchivedPreview[] = [];
   const archivedReasoningPreviewIds: number[] = [];
+  // Use separate draft slot IDs for answer/reasoning lanes to prevent
+  // both lanes from overwriting each other when nativeStreaming is enabled.
+  const DRAFT_IDS: Record<LaneName, number> = { answer: 1, reasoning: 2 };
   const createDraftLane = (laneName: LaneName, enabled: boolean): DraftLaneState => {
     const stream = enabled
       ? createTelegramDraftStream({
@@ -202,6 +205,7 @@ export const dispatchTelegramMessage = async ({
           minInitialChars: draftMinInitialChars,
           renderText: renderDraftPreview,
           nativeStreaming,
+          draftId: DRAFT_IDS[laneName],
           onSupersededPreview:
             laneName === "answer" || laneName === "reasoning"
               ? (preview) => {

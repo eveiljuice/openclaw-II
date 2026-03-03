@@ -171,6 +171,8 @@ export const TelegramAccountSchemaBase = z
     blockStreamingCoalesce: BlockStreamingCoalesceSchema.optional(),
     // Legacy key kept for automatic migration to `streaming`.
     streamMode: z.enum(["off", "partial", "block"]).optional(),
+    // Use Bot API sendMessageDraft (9.5+) for smooth flicker-free streaming.
+    nativeStreaming: z.boolean().optional(),
     mediaMaxMb: z.number().positive().optional(),
     timeoutSeconds: z.number().int().positive().optional(),
     retry: RetryConfigSchema,
