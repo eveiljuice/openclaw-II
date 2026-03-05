@@ -598,8 +598,11 @@ Respond in language: {RESPONSE_LANGUAGE}
 
 # ── REPL Loop ─────────────────────────────────────────────────────────
 
-def execute_tool(name: str, args: dict) -> str:
+def execute_tool(name: str, args: dict, allowed_tool_names: set[str] | None = None) -> str:
     """Execute a tool and return result as string."""
+    if allowed_tool_names is not None and name not in allowed_tool_names:
+        return json.dumps({"error": f"Tool not allowed in this mode: {name}"})
+
     func = TOOLS.get(name)
     if not func:
         return json.dumps({"error": f"Unknown tool: {name}"})
@@ -622,6 +625,7 @@ def run_agent_loop(
     initial_message: str,
     max_iterations: int = MAX_ITERATIONS,
     interactive: bool = False,
+    allowed_tool_names: set[str] | None = None,
 ) -> str:
     """Run the agent REPL loop."""
     messages = [
@@ -634,6 +638,14 @@ def run_agent_loop(
     api_error_streak = 0
     max_api_error_streak = 5
 
+    if allowed_tool_names is None:
+        active_tool_schemas = TOOL_SCHEMAS
+    else:
+        active_tool_schemas = [
+            t for t in TOOL_SCHEMAS
+            if t.get("function", {}).get("name") in allowed_tool_names
+        ]
+
     while iteration < max_iterations:
         log("THINK", f"Итерация {iteration + 1}/{max_iterations}")
 
@@ -641,7 +653,7 @@ def run_agent_loop(
             response = client.chat.completions.create(
                 model=MODEL,
                 messages=messages,
-                tools=TOOL_SCHEMAS,
+                tools=active_tool_schemas,
                 tool_choice="auto",
                 temperature=0.2,
                 max_completion_tokens=2000,
@@ -686,7 +698,7 @@ def run_agent_loop(
             except:
                 fn_args = {}
 
-            result = execute_tool(fn_name, fn_args)
+            result = execute_tool(fn_name, fn_args, allowed_tool_names=allowed_tool_names)
 
             messages.append({
                 "role": "tool",
@@ -793,19 +805,37 @@ def mode_watch(client: OpenAI):
         )
         log("INFO", f"Агент завершил: {result[:200]}")
 
-        # Пауза после починки
+        # Verify recovery before resetting failure counter.
         time.sleep(WATCH_INTERVAL * 2)
-        consecutive_failures = 0
+        post_check = tool_check_gateway()
+        if post_check.get("status") == "ok":
+            consecutive_failures = 0
+        else:
+            consecutive_failures += 1
+            log("WARN", "Gateway всё ещё недоступен после авто-починки")
 
 
 def mode_check(client: OpenAI):
     """Только проверка, без действий."""
     log("INFO", "🩺 OpenClaw Doctor — режим проверки (read-only)")
+
+    read_only_tools = {
+        "check_gateway",
+        "get_logs",
+        "run_doctor",
+        "check_resources",
+        "check_channels",
+        "read_config",
+        "fetch_docs",
+        "systemd_journal",
+    }
+
     result = run_agent_loop(
         client,
         "Проведи диагностику OpenClaw Gateway БЕЗ каких-либо изменений. "
         "Только проверь статус, логи, ресурсы, каналы. Расскажи что нашёл.",
         max_iterations=10,
+        allowed_tool_names=read_only_tools,
     )
     print(f"\n{C.BOLD}=== Отчёт ==={C.RESET}")
     print(result)
