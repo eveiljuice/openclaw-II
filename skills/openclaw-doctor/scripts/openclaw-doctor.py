@@ -20,6 +20,8 @@ import os
 import time
 import argparse
 import signal
+import shlex
+import re
 from datetime import datetime, timezone
 from typing import Any
 from openai import OpenAI
@@ -35,6 +37,7 @@ MAX_ITERATIONS = int(os.environ.get("DOCTOR_MAX_ITERATIONS", "20"))
 WATCH_INTERVAL = int(os.environ.get("DOCTOR_WATCH_INTERVAL", "30"))
 DOCS_URL = "https://docs.openclaw.ai"
 LOG_FILE = "/tmp/openclaw/doctor-agent.log"
+RESPONSE_LANGUAGE = os.environ.get("DOCTOR_RESPONSE_LANGUAGE", "ru")
 
 # Telegram
 TG_BOT_TOKEN = os.environ.get(
@@ -171,25 +174,81 @@ def tool_check_channels() -> dict:
 
 
 def tool_run_command(command: str, timeout: int = 30) -> dict:
-    """Выполнить shell-команду (только безопасные, read-only или openclaw)."""
-    # Блокируем опасные команды
-    dangerous = ["rm -rf", "mkfs", "dd if=", "> /dev/", "chmod 000", "kill -9 1", "shutdown", "reboot"]
-    for d in dangerous:
-        if d in command:
-            return {"error": f"Blocked dangerous command: {command}"}
+    """Run a constrained command (allowlist-only, no shell)."""
+    if not command or len(command.strip()) == 0:
+        return {"error": "Empty command"}
+
+    # No shell metacharacters; this tool is intentionally strict.
+    forbidden_tokens = ["|", "&&", "||", ";", "`", "$(", ">", "<"]
+    if any(tok in command for tok in forbidden_tokens):
+        return {"error": "Blocked: shell metacharacters are not allowed"}
+
+    try:
+        argv = shlex.split(command)
+    except ValueError as e:
+        return {"error": f"Invalid command syntax: {e}"}
+
+    if not argv:
+        return {"error": "Empty command"}
+
+    # Allowlist for diagnostics-focused commands only.
+    allowed = {
+        "openclaw": {
+            "status", "doctor", "logs", "gateway", "channels", "models", "cron", "health"
+        },
+        "systemctl": {"--user"},
+        "journalctl": {"--user", "-u", "-n", "--no-pager"},
+        "ps": set(),
+        "ss": set(),
+        "free": set(),
+        "df": set(),
+        "cat": set(),
+        "tail": set(),
+        "head": set(),
+        "grep": set(),
+        "pgrep": set(),
+        "pkill": set(),
+        "find": set(),
+        "wc": set(),
+        "dmesg": set(),
+        "uname": set(),
+        "uptime": set(),
+        "curl": set(),
+    }
+
+    cmd = argv[0]
+    if cmd not in allowed:
+        return {"error": f"Blocked command: {cmd} not in allowlist"}
+
+    # Extra hardening for systemctl: only openclaw-gateway.service actions.
+    if cmd == "systemctl":
+        allowed_actions = {"status", "restart", "start", "stop"}
+        if len(argv) < 4 or argv[1] != "--user" or argv[2] not in allowed_actions or argv[3] != "openclaw-gateway.service":
+            return {"error": "Blocked systemctl usage; only '--user <action> openclaw-gateway.service' is allowed"}
+
+    # Extra hardening for openclaw subcommands used by this tool.
+    if cmd == "openclaw":
+        if len(argv) >= 2 and argv[1] not in allowed["openclaw"]:
+            return {"error": f"Blocked openclaw subcommand: {argv[1]}"}
+
+    safe_timeout = max(1, min(timeout, 120))
 
     try:
         r = subprocess.run(
-            command, shell=True,
-            capture_output=True, text=True, timeout=timeout
+            argv,
+            shell=False,
+            capture_output=True,
+            text=True,
+            timeout=safe_timeout,
         )
         return {
             "stdout": r.stdout[:3000],
             "stderr": r.stderr[:1000],
             "returncode": r.returncode,
+            "executed": " ".join(argv),
         }
     except subprocess.TimeoutExpired:
-        return {"error": f"Command timed out after {timeout}s"}
+        return {"error": f"Command timed out after {safe_timeout}s"}
     except Exception as e:
         return {"error": str(e)}
 
@@ -261,30 +320,56 @@ def tool_systemd_journal(unit: str = "openclaw-gateway.service", lines: int = 30
 
 
 def tool_kill_zombie_processes(pattern: str) -> dict:
-    """Убить зомби/зависшие процессы по паттерну."""
+    """Kill hung processes by regex pattern (no shell)."""
     if not pattern or len(pattern) < 3:
         return {"error": "Pattern too short (safety)"}
+
+    # Restrict pattern characters to reduce regex abuse and accidental broad matches.
+    if not re.fullmatch(r"[A-Za-z0-9._*+?\-|\[\]()/: ]{3,120}", pattern):
+        return {"error": "Pattern contains disallowed characters"}
+
     try:
-        # Сначала показываем что будем убивать
+        # Preview matching PIDs first
         r = subprocess.run(
-            f"pgrep -f '{pattern}' | head -20",
-            shell=True, capture_output=True, text=True, timeout=5
+            ["pgrep", "-f", pattern],
+            capture_output=True,
+            text=True,
+            timeout=5,
         )
-        pids = r.stdout.strip().split("\n")
-        pids = [p for p in pids if p.strip()]
+        pids = [p.strip() for p in r.stdout.splitlines() if p.strip()]
+
         if not pids:
             return {"status": "no_matching_processes"}
 
-        count = len(pids)
-        subprocess.run(f"pkill -f '{pattern}'", shell=True, timeout=10)
+        # Safety cap
+        if len(pids) > 100:
+            return {"error": f"Refusing to kill too many processes ({len(pids)})"}
+
+        # Kill by exact PID list (avoid shell / pattern expansion)
+        killed = 0
+        for pid in pids:
+            try:
+                subprocess.run(["kill", pid], timeout=2)
+                killed += 1
+            except Exception:
+                pass
+
         time.sleep(2)
-        # Проверяем оставшиеся
+
+        # Re-check remaining
         r2 = subprocess.run(
-            f"pgrep -f '{pattern}' | wc -l",
-            shell=True, capture_output=True, text=True, timeout=5
+            ["pgrep", "-f", pattern],
+            capture_output=True,
+            text=True,
+            timeout=5,
         )
-        remaining = int(r2.stdout.strip() or "0")
-        return {"killed": count, "remaining": remaining}
+        remaining_pids = [p.strip() for p in r2.stdout.splitlines() if p.strip()]
+
+        return {
+            "killed": killed,
+            "remaining": len(remaining_pids),
+            "remaining_pids": remaining_pids[:20],
+        }
     except Exception as e:
         return {"error": str(e)}
 
@@ -456,7 +541,7 @@ TOOL_SCHEMAS = [
         "type": "function",
         "function": {
             "name": "notify_telegram",
-            "description": "Send notification to Telegram (user Timo)",
+            "description": "Send notification to configured Telegram chat", 
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -470,17 +555,16 @@ TOOL_SCHEMAS = [
 
 # ── System prompt ─────────────────────────────────────────────────────
 
-SYSTEM_PROMPT = """You are OpenClaw Doctor — an autonomous DevOps agent that diagnoses and fixes OpenClaw Gateway issues.
+SYSTEM_PROMPT = f"""You are OpenClaw Doctor — an autonomous DevOps agent that diagnoses and fixes OpenClaw Gateway issues.
 
-## Your environment
-- Host: Linux VPS (explicitsalmon.aeza.network)
-- OpenClaw Gateway: systemd service (openclaw-gateway.service), port 18789
-- Node.js process, Telegram bot (@timoclawd_bot)
-- Config: ~/.openclaw/openclaw.json
-- Logs: /tmp/openclaw/openclaw-*.log
+## Environment assumptions
+- Host: Linux machine running OpenClaw Gateway as systemd user service
+- Gateway unit: openclaw-gateway.service (default port 18789)
+- Config path: ~/.openclaw/openclaw.json
+- Logs path: /tmp/openclaw/openclaw-*.log
 - Docs: https://docs.openclaw.ai
 
-## Your workflow (REPL loop)
+## Workflow (REPL loop)
 1. OBSERVE: Check gateway status, logs, resources
 2. DIAGNOSE: Identify the root cause
 3. PLAN: Decide on fix (prefer minimal, safe actions)
@@ -494,9 +578,9 @@ SYSTEM_PROMPT = """You are OpenClaw Doctor — an autonomous DevOps agent that d
 - Only restart gateway after understanding the cause
 - Kill processes only if clearly zombie/hung
 - NEVER modify openclaw.json without explicit user approval
-- NEVER run destructive commands (rm -rf, etc.)
+- NEVER run destructive commands
 - If unsure, notify Telegram and wait for human input
-- When done (fixed or needs human), output your final diagnosis
+- When done (fixed or needs human), output final diagnosis
 
 ## Common issues
 - OOM: high memory → clean caches → restart
@@ -509,7 +593,7 @@ SYSTEM_PROMPT = """You are OpenClaw Doctor — an autonomous DevOps agent that d
 ## Output format
 After each tool call, briefly explain what you found and what you'll do next.
 When done, give a final summary with: diagnosis, actions taken, current status.
-Respond in Russian (Тимо speaks Russian).
+Respond in language: {RESPONSE_LANGUAGE}
 """
 
 # ── REPL Loop ─────────────────────────────────────────────────────────
@@ -547,10 +631,11 @@ def run_agent_loop(
 
     iteration = 0
     final_answer = ""
+    api_error_streak = 0
+    max_api_error_streak = 5
 
     while iteration < max_iterations:
-        iteration += 1
-        log("THINK", f"Итерация {iteration}/{max_iterations}")
+        log("THINK", f"Итерация {iteration + 1}/{max_iterations}")
 
         try:
             response = client.chat.completions.create(
@@ -561,10 +646,21 @@ def run_agent_loop(
                 temperature=0.2,
                 max_completion_tokens=2000,
             )
+            api_error_streak = 0
         except Exception as e:
-            log("ERROR", f"API error: {e}")
-            time.sleep(5)
+            api_error_streak += 1
+            log("ERROR", f"API error ({api_error_streak}/{max_api_error_streak}): {e}")
+            if api_error_streak >= max_api_error_streak:
+                final_answer = (
+                    f"API error streak reached {max_api_error_streak}. "
+                    "Stopping loop to avoid burning iterations without progress."
+                )
+                break
+            time.sleep(min(5 * api_error_streak, 30))
             continue
+
+        # Count only successful model turns against iteration budget
+        iteration += 1
 
         choice = response.choices[0]
         message = choice.message
