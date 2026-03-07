@@ -106,12 +106,20 @@ export function subscribeEmbeddedPiSession(params: SubscribeEmbeddedPiSessionPar
   const partialReplyDirectiveAccumulator = createStreamingDirectiveAccumulator();
   const emitBlockReplySafely = (
     payload: Parameters<NonNullable<SubscribeEmbeddedPiSessionParams["onBlockReply"]>>[0],
+    opts?: { sourceText?: string },
   ) => {
     if (!params.onBlockReply) {
       return;
     }
     void Promise.resolve()
       .then(() => params.onBlockReply?.(payload))
+      .then(() => {
+        // Record in cross-turn dedup cache only after successful delivery.
+        // Recording before send would suppress retries on transient failures.
+        if (opts?.sourceText) {
+          recordDeliveredText(opts.sourceText, state.recentDeliveredTexts);
+        }
+      })
       .catch((err) => {
         log.warn(`block reply callback failed: ${String(err)}`);
       });
@@ -516,8 +524,10 @@ export function subscribeEmbeddedPiSession(params: SubscribeEmbeddedPiSessionPar
     state.lastBlockReplyText = chunk;
     assistantTexts.push(chunk);
     rememberAssistantText(chunk);
-    recordDeliveredText(chunk, state.recentDeliveredTexts);
     if (!params.onBlockReply) {
+      // No block reply callback — text is accumulated for final delivery.
+      // Record now since there's no async send that could fail.
+      recordDeliveredText(chunk, state.recentDeliveredTexts);
       return;
     }
     const splitResult = replyDirectiveAccumulator.consume(chunk);
@@ -536,14 +546,17 @@ export function subscribeEmbeddedPiSession(params: SubscribeEmbeddedPiSessionPar
     if (!cleanedText && (!mediaUrls || mediaUrls.length === 0) && !audioAsVoice) {
       return;
     }
-    emitBlockReplySafely({
-      text: cleanedText,
-      mediaUrls: mediaUrls?.length ? mediaUrls : undefined,
-      audioAsVoice,
-      replyToId,
-      replyToTag,
-      replyToCurrent,
-    });
+    emitBlockReplySafely(
+      {
+        text: cleanedText,
+        mediaUrls: mediaUrls?.length ? mediaUrls : undefined,
+        audioAsVoice,
+        replyToId,
+        replyToTag,
+        replyToCurrent,
+      },
+      { sourceText: chunk },
+    );
   };
 
   const consumeReplyDirectives = (text: string, options?: { final?: boolean }) =>
