@@ -23,7 +23,7 @@ export type RecentDeliveredEntry = {
  * Build a collision-resistant hash from the full normalised text of a
  * delivered assistant message.  Uses a fast non-cryptographic approach:
  * the first 200 normalised chars (for quick prefix screening) combined
- * with the total length and a simple 53-bit numeric hash of the full
+ * with the total length and a simple 32-bit numeric hash of the full
  * string.  This avoids false positives when two responses share the same
  * opening paragraph but diverge later.
  */
@@ -32,7 +32,7 @@ export function buildDeliveredTextHash(text: string): string {
   if (normalized.length <= 200) {
     return normalized;
   }
-  // 53-bit FNV-1a-inspired hash (fits in a JS safe integer).
+  // 32-bit FNV-1a-inspired hash (Math.imul + >>> 0 operate on 32-bit integers).
   let h = 0x811c9dc5;
   for (let i = 0; i < normalized.length; i++) {
     h ^= normalized.charCodeAt(i);

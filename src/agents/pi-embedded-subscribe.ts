@@ -113,13 +113,6 @@ export function subscribeEmbeddedPiSession(params: SubscribeEmbeddedPiSessionPar
     }
     void Promise.resolve()
       .then(() => params.onBlockReply?.(payload))
-      .then(() => {
-        // Record in cross-turn dedup cache only after successful delivery.
-        // Recording before send would suppress retries on transient failures.
-        if (opts?.sourceText) {
-          recordDeliveredText(opts.sourceText, state.recentDeliveredTexts);
-        }
-      })
       .catch((err) => {
         log.warn(`block reply callback failed: ${String(err)}`);
       });
@@ -524,10 +517,14 @@ export function subscribeEmbeddedPiSession(params: SubscribeEmbeddedPiSessionPar
     state.lastBlockReplyText = chunk;
     assistantTexts.push(chunk);
     rememberAssistantText(chunk);
+    // Record in cross-turn dedup cache synchronously — before the async
+    // delivery — to close the race window where context compaction could
+    // trigger a new turn while the Telegram send is still in-flight.
+    // This matches the synchronous recording in pushAssistantText.
+    // Trade-off: if the send fails transiently the text stays in the cache,
+    // but the 1-hour TTL ensures it won't suppress the same text forever.
+    recordDeliveredText(chunk, state.recentDeliveredTexts);
     if (!params.onBlockReply) {
-      // No block reply callback — text is accumulated for final delivery.
-      // Record now since there's no async send that could fail.
-      recordDeliveredText(chunk, state.recentDeliveredTexts);
       return;
     }
     const splitResult = replyDirectiveAccumulator.consume(chunk);
